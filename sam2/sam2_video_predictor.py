@@ -6,13 +6,15 @@
 
 import warnings
 from collections import OrderedDict
-
+import os
+from PIL import Image
 import torch
+import cv2
 import decord
 from tqdm import tqdm
 
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
-from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames ,process_stream_frame
+from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames ,process_stream_frame, _load_img_as_tensor
 
 
 class SAM2VideoPredictor(SAM2Base):
@@ -60,9 +62,19 @@ class SAM2VideoPredictor(SAM2Base):
             #    async_loading_frames=async_loading_frames,
             #    compute_device=compute_device,
             #)
-            video_height, video_width, _ = decord.VideoReader(video_path).next().shape
-            num_frames = len(decord.VideoReader(video_path))
+            is_str = isinstance(video_path, str)
+            is_mp4_path = is_str and os.path.splitext(video_path)[-1] in [".mp4", ".MP4"]
+            is_jpg_path = is_str and os.path.splitext(video_path)[-1] in [".jpg", ".JPG", ".jpeg", ".JPEG"]
+            if is_mp4_path:
+                video_height, video_width, _ = decord.VideoReader(video_path).next().shape
+                num_frames = len(decord.VideoReader(video_path))
             #inference_state["images"] = images
+            if is_jpg_path:
+                video_height
+                num_frames = len([f for f in os.listdir(video_path) if f.endswith(('.jpg', '.JPG', '.jpeg', '.JPEG'))])
+                #read first fraeme to get height and width
+                first_frame_path = os.path.join(video_path, sorted(os.listdir(video_path))[0])
+                video_height, video_width = cv2.imread(first_frame_path).shape[:2]
             inference_state["num_frames"] = num_frames
         else:
             # Real-time streaming mode
@@ -1020,15 +1032,33 @@ class SAM2VideoPredictor(SAM2Base):
 
     def _get_image_feature(self, inference_state, frame_idx, batch_size):
         """Compute the image features on a given frame."""
+        img_mean=(0.485, 0.456, 0.406)
+        img_std=(0.229, 0.224, 0.225)
+        device = torch.device("cuda")
+        img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None].to(device)
+        img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None].to(device)
         # Look up in the cache first
         #image, backbone_out = inference_state["cached_features"].get(
         #    frame_idx, (None, None)
         #)
         #if backbone_out is None:
         # Cache miss -- we will run inference on a single image
-        device = inference_state["device"]
         #image = inference_state["images"][frame_idx].to(device).float().unsqueeze(0)
-        image = decord.VideoReader(inference_state["video_path"])[frame_idx].to(device).float().unsqueeze(0)
+        video_path = inference_state["video_path"]
+        is_mp4_path = os.path.splitext(video_path)[-1] in [".mp4", ".MP4"]
+        is_jpg_path = os.path.splitext(video_path)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+        if is_mp4_path:
+            decord.bridge.set_bridge("torch")
+            image = decord.VideoReader(video_path, width=self.image_size, height=self.image_size)[frame_idx]
+            image = image.permute(2, 0, 1).to(device) # HWC to CHW
+            image = image.unsqueeze(0).float() / 255.0
+        elif is_jpg_path:
+            image = Image.open(os.path.join(video_path, sorted(os.listdir(video_path))[frame_idx]))
+            image = image.resize((self.image_size, self.image_size))
+            image = torch.from_numpy(image).permute(2, 0, 1).to(device)  # HWC to CHW
+            image = image.unsqueeze(0).float() / 255.0
+        image -= img_mean
+        image /= img_std
         backbone_out = self.forward_image(image)
         # Cache the most recent frame's feature (for repeated interactions with
         # a frame; we can use an LRU cache for more frames in the future).
