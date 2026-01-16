@@ -1,0 +1,1 @@
+The main file is efficient_sam.py. Run it with your custom configs
