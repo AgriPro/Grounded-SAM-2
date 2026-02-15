@@ -28,6 +28,8 @@ class RunConfig:
     save_images: bool = False
     save_every_n: int = 1
     out_fps: float = 0.0
+    rescale: bool = False
+    rescale_size: int = 512
     GROUNDING_DINO_CONFIG = "grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py"
     GROUNDING_DINO_CHECKPOINT = "gdino_checkpoints/groundingdino_swint_ogc.pth"
     BOX_THRESHOLD = 0.35
@@ -119,6 +121,11 @@ def run_tracker(configs: RunConfig):
     #boxes = torch.tensor([380, 936, 670, 1122]).unsqueeze(0)
     input_boxes = np.array(configs.boxes)
     class_names = configs.class_names
+    if configs.rescale:
+        scale_factor = max(h, w) / configs.rescale_size
+        rescaled_h, rescaled_w = int(h / scale_factor), int(w / scale_factor)
+        image_source = cv2.resize(image_source, (rescaled_w, rescaled_h))
+
     image_predictor.set_image(image_source)
     OBJECTS = class_names
     ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
