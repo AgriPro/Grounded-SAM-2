@@ -155,7 +155,7 @@ def run_tracker(configs: RunConfig):
                             labels=[ID_TO_OBJECTS[i] for i in out_obj_ids])
             annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
             out_video.write(annotated_frame)
-            if out_frame_idx%500==0:
+            if out_frame_idx%100==0:
                 torch.cuda.empty_cache()
     finally:
         out_video.release()
