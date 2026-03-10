@@ -18,9 +18,9 @@ def download_s3_folder(data_dir: str) -> str:
 
         for obj in response["Contents"]:
             key = obj["Key"]
-            if key.endswith(".csv"):  # only download CSVs
-                local_file = os.path.join(temp_dir, os.path.basename(key))
-                s3.download_file(bucket, key, local_file)
+            #if key.endswith(".csv"):  # only download CSVs
+            local_file = os.path.join(temp_dir, os.path.basename(key))
+            s3.download_file(bucket, key, local_file)
         return temp_dir
     except NoCredentialsError:
         raise ValueError("AWS credentials not found. Please configure your AWS credentials to access S3.")

@@ -37,14 +37,14 @@ def create_video_from_images(image_folder, output_video_path, frame_rate=25):
 
 
 def load_video_frames(configs):
-    cap = cv2.VideoCapture(configs.VIDEO_PATH)
+    cap = cv2.VideoCapture(configs.video_path)
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) //configs.frame_stride
     cap.release()
-    video_info = sv.VideoInfo.from_video_path(configs.VIDEO_PATH)  # get video info
+    video_info = sv.VideoInfo.from_video_path(configs.video_path)  # get video info
     print(video_info)
     h, w = video_info.height, video_info.width
     scale_factor = configs.max_width / max(h, w)
-    frame_generator = sv.get_video_frames_generator(configs.VIDEO_PATH, stride=configs.frame_stride, start=0, end=None)
+    frame_generator = sv.get_video_frames_generator(configs.video_path, stride=configs.frame_stride, start=0, end=None)
 
     # saving video to frames
     source_frames = Path(configs.SOURCE_VIDEO_FRAME_DIR)

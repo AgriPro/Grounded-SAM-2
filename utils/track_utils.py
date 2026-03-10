@@ -39,3 +39,27 @@ def sample_points_from_masks(masks, num_points):
     # convert to np.array
     points = np.array(points, dtype=np.float32)
     return points
+
+
+def masks_to_boxes(masks, obj_ids, min_area=20):
+    """
+    Convert masks → boxes aligned to obj_ids order.
+
+    Returns:
+        boxes: np.ndarray (N, 4)
+        valid_obj_ids: list
+    """
+    boxes = []
+    valid_obj_ids = []
+    for i, obj_id in enumerate(obj_ids):
+        mask = masks[i]
+        ys, xs = np.where(mask > 0)
+        if len(xs) < min_area:
+            raise RuntimeError("Mask missing at chunk boundary")
+        x1, x2 = xs.min(), xs.max()
+        y1, y2 = ys.min(), ys.max()
+        boxes.append([x1, y1, x2, y2])
+        valid_obj_ids.append(obj_id)
+    if len(boxes) == 0:
+        return None, None
+    return np.array(boxes), valid_obj_ids

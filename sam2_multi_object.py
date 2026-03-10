@@ -1,6 +1,5 @@
 import os
 import cv2
-import base64
 import torch
 import numpy as np
 import supervision as sv
@@ -8,21 +7,26 @@ from pathlib import Path
 from tqdm import tqdm
 import pandas as pd
 from PIL import Image
+from torchvision.ops import box_convert
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
+#from sam2.sam2_image_predictor import SAM2ImagePredictor
+from grounding_dino.groundingdino.util.inference import load_model, load_image, predict
 from dataclasses import dataclass
 from configs.defaults import RunConfig
 from utils.file_utils import download_s3_folder
 from utils.plot_utils import draw_counter
 from utils.video_utils import create_video_from_images, load_video_frames
 from utils.setup_utils import setup_environment
+from utils.track_utils import masks_to_boxes
+from utils.log_utils import setup_logger
+logger = setup_logger(__name__)
 
 
-def main(configs: RunConfig):
+def process_video(configs: RunConfig):
     torch.autocast(device_type=configs.DEVICE, dtype=torch.bfloat16).__enter__()
-    configs.VIDEO_PATH = os.path.join(configs.data_dir, configs.VIDEO_PATH)
+    configs.video_path = os.path.join(configs.data_dir, configs.video_path)
     configs.gaze_path = os.path.join(configs.data_dir, configs.gaze_path)
-    cap = cv2.VideoCapture(configs.VIDEO_PATH)
+    cap = cv2.VideoCapture(configs.video_path)
     input_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)//configs.frame_stride
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
@@ -43,73 +47,119 @@ def main(configs: RunConfig):
     gy = (gy * scale_factor).astype(np.int32)
 
     video_predictor = build_sam2_video_predictor(configs.model_cfg, configs.sam2_checkpoint)
-    sam2_image_model = build_sam2(configs.model_cfg, configs.sam2_checkpoint)
+    grounding_model = load_model(
+        model_config_path=configs.GROUNDING_DINO_CONFIG,
+        model_checkpoint_path=configs.GROUNDING_DINO_CHECKPOINT,
+        device=configs.DEVICE
+    )
+    #sam2_image_model = build_sam2(configs.model_cfg, configs.sam2_checkpoint)
     #image_predictor = SAM2ImagePredictor(sam2_image_model)
     frame_names = load_video_frames(configs)
     inference_state = video_predictor.init_state(video_path=configs.SOURCE_VIDEO_FRAME_DIR)
     if not os.path.exists(configs.SAVE_TRACKING_RESULTS_DIR):
         os.makedirs(configs.SAVE_TRACKING_RESULTS_DIR)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out_video = cv2.VideoWriter(configs.OUTPUT_VIDEO_PATH, fourcc, 30, (scaled_width, scaled_height))
+    out_video = cv2.VideoWriter(configs.output_video_path, fourcc, 30, (scaled_width, scaled_height))
     # Annotators
     box_annotator = sv.BoxAnnotator()
     label_annotator = sv.LabelAnnotator()
     mask_annotator = sv.MaskAnnotator()
-    # RUN THIS CELL ONLY WHEN BOX COORDINATES HAS TO BE READ FROM CONFIG FILE
-    input_boxes = np.array(configs.boxes)
-    class_names = configs.class_names
+    img_path = os.path.join(configs.SOURCE_VIDEO_FRAME_DIR, frame_names[configs.ann_frame_idx])
+
+    if configs.boxes is not None and len(configs.boxes) > 0:
+        input_boxes = np.array(configs.boxes)
+        class_names = configs.class_names
+    else:
+        image_source, image = load_image(img_path)
+        h, w, _ = image_source.shape
+        boxes, confidences, class_names = predict(
+            model=grounding_model,
+            image=image,
+            caption=configs.TEXT_PROMPT,
+            box_threshold=configs.BOX_THRESHOLD,
+            text_threshold=configs.TEXT_THRESHOLD,
+            device=configs.DEVICE
+        )
+        boxes = boxes * torch.Tensor([w, h, w, h])
+        input_boxes = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+        confidences = np.array(confidences)
     #image_predictor.set_image(image_source)
     OBJECTS = class_names
     ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
-    with torch.no_grad():
-        for object_id, (label, box) in enumerate(zip(OBJECTS, input_boxes), start=1):
-            _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=configs.ann_frame_idx,
-                obj_id=object_id,
-                box=box,
-            )
+    CHUNK = 5000
+    start_frame_idx = configs.ann_frame_idx
     attention_tracker = 0
     attention_tracker_objects = {i: 0 for i in range(1, len(OBJECTS) + 1)}
-    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
-        frame_path = os.path.join(configs.SOURCE_VIDEO_FRAME_DIR, frame_names[out_frame_idx])
-        img = cv2.imread(frame_path)
-        out_mask_logits = out_mask_logits.to(torch.bfloat16)
-        masks = (out_mask_logits > 0.0).cpu().numpy()
-        torch.cuda.empty_cache()
-        if masks.ndim == 4: # Handle (N, 1, H, W) if necessary
-            masks = masks.squeeze(1)
-        mask_all_bool = masks > 0.0
-        mask_bool = np.any(mask_all_bool, axis=0).astype(np.uint8)
-        #plot it on the image
-        detections = sv.Detections(
-            xyxy=sv.mask_to_xyxy(masks),  # (n, 4)
-            mask=masks, # (n, h, w)
-            class_id=np.array(out_obj_ids, dtype=np.int32),
-        )
-        annotated_frame = box_annotator.annotate(scene=img, detections=detections)
-        mask_labels = [f"{ID_TO_OBJECTS[i]}: {attention_tracker_objects[i]}" for i in out_obj_ids]
-        annotated_frame = label_annotator.annotate(annotated_frame, detections=detections,
-                        labels=mask_labels)
-        annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
-        try:
-            for i, obj_id in enumerate(out_obj_ids):
-                obj_mask = masks[i]
-                if obj_mask[gy[out_frame_idx], gx[out_frame_idx]] > 0:
-                    attention_tracker_objects[obj_id] += 1
-                    attention_tracker += 1
-            draw_counter(annotated_frame, f"{attention_tracker}",origin=(10, 30))
-            cv2.circle(annotated_frame, (gx[out_frame_idx], gy[out_frame_idx]), 8, (0,0,255), -1)
-        except:
-            print(f"gaze index out of bounds for {out_frame_idx}")
-        out_video.write(annotated_frame)
-        output_path = os.path.join(configs.SAVE_TRACKING_RESULTS_DIR, frame_names[out_frame_idx])
-        cv2.imwrite(output_path, annotated_frame)
-
+    attention_over_time = np.zeros(frame_count, dtype=np.int32)
+    start_time = cv2.getTickCount()  # Start time for FPS calculation
+    pbar = tqdm(total=frame_count, desc="Processing Video")
+    with torch.no_grad():
+        while start_frame_idx < frame_count:
+            inference_state = video_predictor.init_state(video_path=configs.SOURCE_VIDEO_FRAME_DIR)
+            for object_id, (label, box) in enumerate(zip(OBJECTS, input_boxes), start=1):
+                _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=start_frame_idx,
+                    obj_id=object_id,
+                    box=box,
+                )
+            for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state, max_frame_num_to_track=CHUNK):
+                frame_path = os.path.join(configs.SOURCE_VIDEO_FRAME_DIR, frame_names[out_frame_idx])
+                out_mask_logits = out_mask_logits.to(torch.bfloat16)
+                masks = (out_mask_logits > 0.0).cpu().numpy()
+                torch.cuda.empty_cache()
+                if masks.ndim == 4: # Handle (N, 1, H, W) if necessary
+                    masks = masks.squeeze(1)
+                mask_all_bool = masks > 0.0
+                mask_bool = np.any(mask_all_bool, axis=0).astype(np.uint8)
+                detections = sv.Detections(
+                    xyxy=sv.mask_to_xyxy(masks),  # (n, 4)
+                    mask=masks, # (n, h, w)
+                    class_id=np.array(out_obj_ids, dtype=np.int32),
+                )
+                if configs.save_images:
+                    img = cv2.imread(frame_path)                
+                    annotated_frame = box_annotator.annotate(scene=img, detections=detections)
+                    mask_labels = [f"{ID_TO_OBJECTS[i]}: {attention_tracker_objects[i]}" for i in out_obj_ids]
+                    annotated_frame = label_annotator.annotate(annotated_frame, detections=detections,
+                                labels=mask_labels)
+                    annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
+                try:
+                    for i, obj_id in enumerate(out_obj_ids):
+                        obj_mask = masks[i]
+                        if obj_mask[gy[out_frame_idx], gx[out_frame_idx]] > 0:
+                            attention_tracker_objects[obj_id] += 1
+                            attention_over_time[out_frame_idx] = obj_id
+                    if mask_bool[gy[out_frame_idx], gx[out_frame_idx]] > 0:
+                        attention_tracker += 1
+                        if configs.save_images:
+                            draw_counter(annotated_frame, f"{attention_tracker}",origin=(10, 30))
+                    if configs.save_images:        
+                        cv2.circle(annotated_frame, (gx[out_frame_idx], gy[out_frame_idx]), 10, (0,0,255), -1)
+                except:
+                    logger.info(f"gaze index out of bounds for {out_frame_idx}")
+                if configs.save_images:
+                    out_video.write(annotated_frame)
+                    output_path = os.path.join(configs.SAVE_TRACKING_RESULTS_DIR, frame_names[out_frame_idx])
+                    cv2.imwrite(output_path, annotated_frame)
+                pbar.update(1)
+            input_boxes, valid_obj_ids = masks_to_boxes(masks, out_obj_ids)
+            video_predictor.reset_state(inference_state)
+            torch.cuda.empty_cache()
+            start_frame_idx += CHUNK
+    pbar.close()
     out_video.release()
+    video_predictor.reset_state(inference_state)
+    logger.info(f"Processing complete. Video saved to {configs.output_video_path}")
+    elapsed_time = (cv2.getTickCount() - start_time) / cv2.getTickFrequency()
+    logger.info(f"Elapsed time: {elapsed_time:.2f} seconds")
+    avg_fps = frame_count / elapsed_time if elapsed_time > 0 else 0
+    logger.info(f"Average FPS: {avg_fps:.2f}")
+    torch.cuda.empty_cache()
     # percentage of attention on each object
     for obj_id, count in attention_tracker_objects.items():
-        print(f"{ID_TO_OBJECTS[obj_id]}: {count/frame_count*100:.2f}%")
+        logger.info(f"{ID_TO_OBJECTS[obj_id]}: {count/frame_count*100:.2f}%")
+    return attention_over_time, attention_tracker_objects    
 
 if __name__ == "__main__":
     setup_environment()
@@ -120,4 +170,4 @@ if __name__ == "__main__":
         local_dir = download_s3_folder(configs.data_dir)
         configs.data_dir = local_dir
         configs.remote_dir = configs.data_dir
-    main(configs)
+    process_video(configs)
