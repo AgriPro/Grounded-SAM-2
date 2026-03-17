@@ -1,5 +1,7 @@
 # server.py (abbrev)
+import json
 import os
+import shutil
 from fastapi import FastAPI, BackgroundTasks, Request
 import boto3
 import uuid
@@ -82,11 +84,25 @@ def handle_video_job(payload: InferenceRequest, tmpdir: str):
 
         upload_to_s3(configs.output_video_path, bucket, s3_object_path)
         logger.info(f"Successfully uploaded result to {s3_object_path}")
+        results_data = {
+            "attention_tracker_objects": attention_tracker_objects,
+            "attention_over_time": attention_over_time.tolist(),
+            "metadata": {
+                "s3_input": payload.s3_dir,
+                "frame_count": len(attention_over_time)
+            }
+        }
+        results_json_path = os.path.join(tmpdir, "attention_results.json")
+        with open(results_json_path, "w") as f:
+            json.dump(results_data, f)
+        s3_results_object_path = os.path.join(prefix, "attention_results.json")
+        upload_to_s3(results_json_path, bucket, s3_results_object_path)
 
     except Exception as e:
         logger.error(f"Job failed in background: {str(e)}")
     finally:
         is_processing = False  # Always release the lock
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 @app.post("/invocations")
 async def invocations(payload: InferenceRequest, background_tasks: BackgroundTasks):
